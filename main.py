@@ -9,6 +9,7 @@ import matplotlib.transforms as transforms
 
 
 # import iterated_extended_kalman_filter as iekf
+from sympy import latex
 
 
 def read_data_mat(subdir_name, file_name):
@@ -34,13 +35,15 @@ def unpack_data(data_dict):
     ang_true = data_dict['th_true'].flatten()
     valid_flg = data_dict['true_valid'].flatten()
     dist_lidar_rel_body = data_dict['d'].flatten()
-    # range_meas_var = mat_contents['r_var'].flatten()  # unused
-    # ang_meas_var = mat_contents['b_var'].flatten()  # unused
-    # vel_meas_var = mat_contents['v_var'].flatten()  # unused
-    # ang_vel_meas_var = mat_contents['om_var'].flatten()  # unused
+    range_meas_var = data_dict['r_var'].flatten()  # unused
+    ang_meas_var = data_dict['b_var'].flatten()  # unused
+    vel_meas_var = data_dict['v_var'].flatten()  # unused
+    ang_vel_meas_var = data_dict['om_var'].flatten()  # unused
     t_step_count = t.size
     landmarks_count = landmarks_pos_x_true.size
-    t_step = t[1]
+    t_step = 0.1
+
+    print(f'Provided meas variance values: range={range_meas_var}, vel={vel_meas_var}, ang={ang_meas_var}, angvel={ang_vel_meas_var}')
 
     return t, range_meas, ang_meas, vel_norm_meas, ang_vel_meas, landmarks_pos_x_true, landmarks_pos_y_true, pos_x_true, \
            pos_y_true, ang_true, valid_flg, dist_lidar_rel_body, t_step_count, t_step, landmarks_count
@@ -124,7 +127,7 @@ def plot_data(t, range_meas, ang_meas, vel_norm_meas, ang_vel_meas, pos_x_true, 
     # axs4.set_xlabel('Time (s)')
 
 
-def compute_measurement_stats(flg_stats_print, range_meas, ang_meas, vel_norm_meas, ang_vel_meas, landmarks_pos_x_true,
+def compute_measurement_stats(flg_print_stats, range_meas, ang_meas, vel_norm_meas, ang_vel_meas, landmarks_pos_x_true,
                               landmarks_pos_y_true, pos_x_true, pos_y_true, ang_true, valid_flg, dist_lidar_rel_body,
                               t_step_count, t_step, landmarks_count):
     # Speed process noise
@@ -141,6 +144,11 @@ def compute_measurement_stats(flg_stats_print, range_meas, ang_meas, vel_norm_me
     proc_noise[1, 1:] = np.where(ang_true_del < -np.pi,
                                  (ang_true_del + 2 * np.pi) / t_step - ang_vel_meas[1:],
                                  proc_noise[1, 1:])
+    # Transformed process noise, w_k^\prime
+    proc_noise_transform = np.zeros((3, t_step_count))
+    proc_noise_transform[0, :] = proc_noise[0, :]*t_step*np.cos(ang_true)
+    proc_noise_transform[1, :] = proc_noise[0, :]*t_step*np.sin(ang_true)
+    proc_noise_transform[2, :] = proc_noise[1, :]*t_step
 
     # Measurement noise
     meas_count = np.count_nonzero(range_meas)
@@ -165,25 +173,33 @@ def compute_measurement_stats(flg_stats_print, range_meas, ang_meas, vel_norm_me
 
     # Compute noise statistics
     pos_true_mean = np.mean(np.abs(pos_x_true) * np.abs(pos_y_true))
+    vel_norm_meas_mean = np.mean(np.abs(vel_norm_meas))
+    ang_vel_meas_mean = np.mean(np.abs(ang_vel_meas))
     meas_noise_mean = np.mean(meas_noise, axis=1)
     meas_noise_var = np.var(meas_noise, axis=1)
     r_meas_noise_cov = np.cov(meas_noise)
     proc_noise_mean = np.mean(proc_noise, axis=1)
     proc_noise_var = np.var(proc_noise, axis=1)
     q_proc_noise_cov = np.cov(proc_noise)
+    proc_noise_transform_var = np.var(proc_noise_transform, axis=1)
+    q_proc_noise_transform_cov = np.cov(proc_noise_transform)
 
     # Noise statistics print
-    if flg_stats_print == 1:
+    if flg_print_stats == 1:
         print('*** Noise Statistics  ***\n'
               f'Valid data count is {np.sum(valid_flg)} out of {t_step_count}\n'
               f'Measurement count is {meas_count}, last count is {k}\n'
-              f'Position mean = {pos_true_mean:1.3f} m\n'
-              f'Measurement noise: mean={meas_noise_mean} m, var={meas_noise_var} m,'
-              f' std={np.sqrt(meas_noise_var)} m, cov = {r_meas_noise_cov} m\n'
-              f'Measurement noise: mean={proc_noise_mean} m, var={proc_noise_var} m,'
-              f' std={np.sqrt(proc_noise_var)} m, cov = {q_proc_noise_cov} m\n')
+              f'Position mean = {pos_true_mean:1.3f} m, speed mean = {vel_norm_meas_mean:1.3f} m/s, '
+              f'ang vel mean = {ang_vel_meas_mean:1.3f} rad/s\n'
+              f'Measurement noise: mean={meas_noise_mean}, 3std={3*np.sqrt(meas_noise_var)},\n'
+              f' std={np.sqrt(meas_noise_var)}, cov = {r_meas_noise_cov}\n'
+              f'Process noise: mean={proc_noise_mean}, 3std={3*np.sqrt(proc_noise_var)},\n'
+              f' std={np.sqrt(proc_noise_var)}, cov = {q_proc_noise_cov}\n'
+              f'Process noise transformed: 3std={3*np.sqrt(proc_noise_transform_var)},\n'
+              f' std={np.sqrt(proc_noise_transform_var)}, cov = {q_proc_noise_transform_cov}\n')
 
-    return proc_noise, meas_noise, pos_true_mean, meas_noise_mean, r_meas_noise_cov, proc_noise_mean, q_proc_noise_cov
+    return proc_noise, meas_noise, pos_true_mean, meas_noise_mean, r_meas_noise_cov, proc_noise_mean, \
+           q_proc_noise_transform_cov
 
 
 def plot_noise(t, proc_noise, meas_noise, meas_noise_mean, r_meas_noise_cov, proc_noise_mean, q_proc_noise_cov):
@@ -207,7 +223,7 @@ def plot_noise(t, proc_noise, meas_noise, meas_noise_mean, r_meas_noise_cov, pro
     # PLOT03: Model Noise Histogram
     fig3, axs3 = plt.subplots(2, 2)
     n_pts_plot = 100
-    bins = axs3[0, 0].hist(proc_noise[0, :], 20, density=1)[1]
+    bins = axs3[0, 0].hist(proc_noise[0, :], 30, range=(-0.2, 0.2),density=1)[1]
     proc_noise_fit_bins = np.linspace(bins[0], bins[-1], n_pts_plot)
     proc_noise_std = np.sqrt(q_proc_noise_cov[0, 0])
     proc_noise_fit = norm.pdf(proc_noise_fit_bins, proc_noise_mean[0], proc_noise_std)
@@ -217,7 +233,7 @@ def plot_noise(t, proc_noise, meas_noise, meas_noise_mean, r_meas_noise_cov, pro
                     horizontalalignment='right', verticalalignment='top', transform=axs3[0, 0].transAxes)
     axs3[0, 0].set_title("Process Noise Histogram")
 
-    bins = axs3[1, 0].hist(proc_noise[1, :], 20, density=1)[1]
+    bins = axs3[1, 0].hist(proc_noise[1, :], 30, range=(-0.3, 0.3), density=1)[1]
     proc_noise_fit_bins = np.linspace(bins[0], bins[-1], n_pts_plot)
     proc_noise_std = np.sqrt(q_proc_noise_cov[1, 1])
     proc_noise_fit = norm.pdf(proc_noise_fit_bins, proc_noise_mean[1], proc_noise_std)
@@ -226,7 +242,7 @@ def plot_noise(t, proc_noise, meas_noise, meas_noise_mean, r_meas_noise_cov, pro
     axs3[1, 0].text(0.95, 0.95, fr'$\mu={proc_noise_mean[1]:1.3e}, \sigma={proc_noise_std:1.3f}$',
                     horizontalalignment='right', verticalalignment='top', transform=axs3[1, 0].transAxes)
 
-    bins = axs3[0, 1].hist(meas_noise[0, :], 20, density=1)[1]
+    bins = axs3[0, 1].hist(meas_noise[0, :], 30, range=(-0.15, 0.15), density=1)[1]
     meas_noise_fit_bins = np.linspace(bins[0], bins[-1], n_pts_plot)
     meas_noise_std = np.sqrt(r_meas_noise_cov[0, 0])
     meas_noise_fit = norm.pdf(meas_noise_fit_bins, meas_noise_mean[0], meas_noise_std)
@@ -236,7 +252,7 @@ def plot_noise(t, proc_noise, meas_noise, meas_noise_mean, r_meas_noise_cov, pro
                     horizontalalignment='right', verticalalignment='top', transform=axs3[0, 1].transAxes)
     axs3[0, 1].set_title("Measurement Noise Histogram")
 
-    bins = axs3[1, 1].hist(meas_noise[1, :], 20, density=1)[1]
+    bins = axs3[1, 1].hist(meas_noise[1, :], 30, range=(-0.1, 0.1), density=1)[1]
     meas_noise_fit_bins = np.linspace(bins[0], bins[-1], n_pts_plot)
     meas_noise_std = np.sqrt(r_meas_noise_cov[1, 1])
     meas_noise_fit = norm.pdf(meas_noise_fit_bins, meas_noise_mean[1], meas_noise_std)
@@ -339,6 +355,22 @@ def confidence_ellipse(x, y, ax, n_std=3.0, facecolor='none', **kwargs):
     return ax.add_patch(ellipse)
 
 
+def print_jacobians():
+    import sympy
+    sympy.init_printing(use_latex='mathjax')
+
+    x, y, theta, T, v, w1, w2, r, psi, n1, n2, xl, yl, d, om = sympy.symbols('x,y,theta,T,v,w1,w2,r,psi,n1,n2,xl,yl,d,om')
+    state = sympy.Matrix([x, y, theta])
+    motion_model = sympy.Matrix([x+T*sympy.cos(theta)*(v+w1), y+T*sympy.sin(theta)*(v+w1), theta+T*(om+w2)])
+    motion_model_jacobian = motion_model.jacobian(state)
+    measurement_model = sympy.Matrix([sympy.sqrt((xl-x-d*sympy.cos(theta))**2+(yl-y-d*sympy.sin(theta))**2)+n1,
+                                      sympy.atan2(yl-y-d*sympy.sin(theta), xl-x-d*sympy.cos(theta))-theta+n2])
+    measurement_model_jacobian = measurement_model.jacobian(state)
+
+    print('F = ', latex(motion_model_jacobian))
+    print('G = ', latex(measurement_model_jacobian))
+
+
 # def plot_iekf():
 #     # Post process results
 #     pos_est_err = pos_est_corr - pos_true
@@ -392,8 +424,9 @@ def confidence_ellipse(x, y, ax, n_std=3.0, facecolor='none', **kwargs):
 
 def main():
     # Define flags
-    flg_plot_show = 1  # 0, 1
-    flg_stats_print = 1  # 0, 1
+    flg_plot_show = 0  # 0, 1
+    flg_print_stats = 1  # 0, 1
+    flg_print_jacobians = 0  # 0, 1
     flg_debug_prop_only = 0  # 0, 1
     # Define parameters
     range_max = 1  # 1, 3, 5
@@ -410,12 +443,16 @@ def main():
               landmarks_pos_x_true, landmarks_pos_y_true, dist_lidar_rel_body)
     # Q1: Compute statistics from measurement data
     proc_noise, meas_noise, pos_true_mean, meas_noise_mean, r_meas_noise_cov, proc_noise_mean, q_proc_noise_cov = \
-        compute_measurement_stats(flg_stats_print, range_meas, ang_meas, vel_norm_meas, ang_vel_meas,
+        compute_measurement_stats(flg_print_stats, range_meas, ang_meas, vel_norm_meas, ang_vel_meas,
                                   landmarks_pos_x_true, landmarks_pos_y_true, pos_x_true, pos_y_true, ang_true,
                                   valid_flg, dist_lidar_rel_body, t_step_count, t_step, landmarks_count)
     plot_noise(t, proc_noise, meas_noise, meas_noise_mean, r_meas_noise_cov, proc_noise_mean, q_proc_noise_cov)
+    # Q2 Verify Jacobians derivation
+    if flg_print_jacobians == 1:
+        print_jacobians()
+    # Q4 Call EKF on data
 
-    # # Q5: Call RTS smoother on data
+    # Q5: Call RTS smoother on data
     # q_proc_noise_cov = 0.002  # instead of using prop_err_std ** 2, we inflate the process noise
     # iekf.iekf_filter(pos_meas, vel_meas, pos_true, t, samples_count, t_step, q_proc_noise_cov, r_meas_noise_cov,
     #                  flg_debug_fwd_only, update_interval_indices, a_trans_mat, c_obs_mat)
