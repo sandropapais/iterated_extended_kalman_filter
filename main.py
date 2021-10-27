@@ -6,9 +6,7 @@ from scipy.stats import norm
 from statsmodels.graphics.gofplots import qqplot
 from matplotlib.patches import Ellipse
 import matplotlib.transforms as transforms
-
-
-# import iterated_extended_kalman_filter as iekf
+import iterated_extended_kalman_filter as iekf
 from sympy import latex
 
 
@@ -371,6 +369,152 @@ def print_jacobians():
     print('G = ', latex(measurement_model_jacobian))
 
 
+def run_estimation(state_ini, cov_ini, r_meas_noise_cov, q_proc_noise_cov, t_step_count,
+                   range_meas, ang_meas, vel_norm_meas, ang_vel_meas, range_lim,
+                   t,  t_step, flg_debug_prop_only):
+    # Define parameters
+    dim_states = 3
+    dim_input = 2
+    dim_meas = 24  # max possible measurements
+
+    # Pack input matrices
+    input_meas = np.zeros((dim_input, t_step_count))
+    input_meas[0, :] = vel_norm_meas
+    input_meas[1, :] = ang_vel_meas
+    meas = np.zeros((dim_meas, t_step_count))
+    meas_count = np.zeros(t_step_count)
+
+    # Remove measurements above range limit
+    range_meas[range_meas > range_lim] = 0
+
+    # Initialize results matrices
+    state_pred = np.zeros((dim_states, t_step_count))
+    state_est = np.zeros((dim_states, t_step_count))
+    cov_pred = np.zeros((dim_states, dim_states, t_step_count))
+    cov_est = np.zeros((dim_states, dim_states, t_step_count))
+
+    # Estimation loop
+    for i in range(0, t_step_count):
+        # Prediction step
+        if i == 0:
+            state_pred[:, i] = state_ini
+            cov_pred[:, :, i] = cov_ini
+        else:
+            state_pred[:, i] = motion_model_func(state_est[:, i-1], input_meas[:, i], t_step)
+            state_transition_mat = state_transition_func(state_est[:, i-1], input_meas[:, i], t_step)
+            cov_pred[:, :, i] = state_transition_mat * cov_est[:, :, i - 1] * state_transition_mat.T + q_proc_noise_cov
+        # Correction step
+        meas_count[i] = np.count_nonzero(range_meas[i, :])
+        if meas_count[i] == 0 or flg_debug_prop_only == 1:
+            state_est[:, i] = state_pred[:, i]
+            cov_est[:, i] = cov_pred[:, i]
+        else:
+            # Create measurement vector
+            meas_idx = range_meas[i, :] != 0
+            meas[:meas_count[i], i] = range_meas[meas_idx]
+            meas[meas_count[i]:2*meas_count[i], i] = ang_meas[meas_idx]
+            # Compute Kalman gain
+            observation_matrix = observation_matrix_func()  # TODO
+            cov_dot_obs_mat_trans = cov_pred[:, :, i].dot(observation_matrix.T)
+            innov_cov = observation_matrix.dot(cov_dot_obs_mat_trans) + q_proc_noise_cov
+            innov_cov_inv = np.linalg.inv(innov_cov)
+            kalman_gain = cov_dot_obs_mat_trans.dot(innov_cov_inv)
+            # Update state and covariance
+            # P = (I-KG)P(I-KG)' + KRK' is more numerically stable than P = (I-KG)P usually seen in the literature
+            eye = np.eye(dim_states)
+            eye_minus_gain_dot_obs_mat = eye - kalman_gain.dot(observation_matrix)
+            cov_est[:, :, i] = eye_minus_gain_dot_obs_mat.dot(cov_pred[:, :, i].dot(eye_minus_gain_dot_obs_mat.T)) \
+                               + kalman_gain.dot(r_meas_noise_cov.dot(kalman_gain.T))
+            meas_pred = measurement_model_func()  # TODO
+            state_est[:, i] = state_pred[:, i] + kalman_gain.dot(meas - meas_pred)
+
+def motion_model_func(state_vec_est_prev, input_vec, t_step):
+    # Unpack vectors
+    pos_x_est_prev = state_vec_est_prev[0]
+    pos_y_est_prev = state_vec_est_prev[1]
+    ang_est_prev = state_vec_est_prev[2]
+    speed_meas = input_vec[0]
+    ang_rate_meas = input_vec[1]
+
+    # Compute predicted state from motion model
+    pos_x_pred = pos_x_est_prev + t_step * np.cos(ang_est_prev) * speed_meas
+    pos_y_pred = pos_y_est_prev + t_step * np.sin(ang_est_prev) * speed_meas
+    ang_pred = ang_est_prev + t_step * ang_rate_meas
+    ang_pred = angle_wrap(ang_pred)
+    state_vec_pred = np.array([[pos_x_pred, pos_y_pred, ang_pred]]).T
+
+    return state_vec_pred
+
+
+def state_transition_func(state_vec_est_prev, input_vec, t_step):
+    # Unpack vectors
+    ang_est_prev = state_vec_est_prev[2]
+    speed_meas = input_vec[0]
+
+    # Motion model Jacobian
+    state_transition_matrix = np.array([[1, 0, -t_step*np.sin(ang_est_prev)*speed_meas],
+                                        [0, 1, t_step*np.cos(ang_est_prev)*speed_meas],
+                                        [0, 0, 1]])
+
+    return state_transition_matrix
+
+
+def measurement_model_func(landmarks_pos_x_vec, landmarks_pos_y_vec, landmarks_range_meas_vec,
+                           state_vec_pred, dist_lidar_rel_body, num_landmarks, num_meas):
+    # Unpack state vector
+    pos_x_pred = state_vec_pred[0]
+    pos_y_pred = state_vec_pred[1]
+    ang_pred = state_vec_pred[2]
+
+    # Initialize output
+    meas_vec_pred = np.zeros((2*num_meas, 1))
+
+    # Loop through valid measurements
+    for i in range(0, num_landmarks):
+        if landmarks_range_meas_vec[i] != 0:
+            range_meas_pred = np.sqrt((landmarks_pos_x_vec[i]-pos_x_pred-dist_lidar_rel_body*np.cos(ang_pred))**2 +
+                                      (landmarks_pos_y_vec[i]-pos_y_pred-dist_lidar_rel_body*np.sin(ang_pred))**2)
+            ang_meas_pred = np.arctan2(landmarks_pos_y_vec[i]-pos_y_pred-dist_lidar_rel_body*np.sin(ang_pred),
+                                       landmarks_pos_x_vec[i]-pos_x_pred-dist_lidar_rel_body*np.cos(ang_pred)) \
+                            - ang_pred
+            ang_meas_pred = angle_wrap(ang_meas_pred)
+            meas_vec_pred[i] = range_meas_pred
+            meas_vec_pred[num_meas+i] = ang_meas_pred
+
+    return meas_vec_pred
+
+
+def observation_matrix_func(landmarks_pos_x_vec, landmarks_pos_y_vec, landmarks_range_meas_vec,
+                            state_vec_pred, dist_lidar_rel_body, num_landmarks, num_meas):
+    # Unpack state vector
+    pos_x_pred = state_vec_pred[0]
+    pos_y_pred = state_vec_pred[1]
+    ang_pred = state_vec_pred[2]
+
+    # Initialize output
+    observation_matrix = np.zeros((2*num_meas, 3))
+
+    # Loop through valid measurements
+    for i in range(0, num_landmarks):
+        if landmarks_range_meas_vec[i] != 0:
+            temp = 1  # TODO
+
+    return observation_matrix
+
+
+# def angle_vec_wrap(angle_vec):
+#     wrapped_angle_vec = np.where(angle_vec > np.pi, angle_vec - 2 * np.pi, angle_vec)
+#     wrapped_angle_vec = np.where(wrapped_angle_vec < -np.pi, wrapped_angle_vec + 2 * np.pi, wrapped_angle_vec)
+#
+#     return wrapped_angle_vec
+
+
+def angle_wrap(angle):
+    wrapped_angle = angle - 2 * np.pi if angle > np.pi else angle
+    wrapped_angle = wrapped_angle + 2 * np.pi if wrapped_angle < -np.pi else wrapped_angle
+
+    return wrapped_angle
+
 # def plot_iekf():
 #     # Post process results
 #     pos_est_err = pos_est_corr - pos_true
@@ -428,10 +572,12 @@ def main():
     flg_print_stats = 1  # 0, 1
     flg_print_jacobians = 0  # 0, 1
     flg_debug_prop_only = 0  # 0, 1
+
     # Define parameters
     range_max = 1  # 1, 3, 5
     a_trans_mat = 1
     c_obs_mat = 1
+
     # Load data file
     subdir_name = 'data'
     file_name = 'dataset2.mat'
@@ -441,21 +587,25 @@ def main():
         = unpack_data(data_dict)
     plot_data(t, range_meas, ang_meas, vel_norm_meas, ang_vel_meas, pos_x_true, pos_y_true, ang_true, t_step, valid_flg,
               landmarks_pos_x_true, landmarks_pos_y_true, dist_lidar_rel_body)
+
     # Q1: Compute statistics from measurement data
     proc_noise, meas_noise, pos_true_mean, meas_noise_mean, r_meas_noise_cov, proc_noise_mean, q_proc_noise_cov = \
         compute_measurement_stats(flg_print_stats, range_meas, ang_meas, vel_norm_meas, ang_vel_meas,
                                   landmarks_pos_x_true, landmarks_pos_y_true, pos_x_true, pos_y_true, ang_true,
                                   valid_flg, dist_lidar_rel_body, t_step_count, t_step, landmarks_count)
     plot_noise(t, proc_noise, meas_noise, meas_noise_mean, r_meas_noise_cov, proc_noise_mean, q_proc_noise_cov)
+
     # Q2 Verify Jacobians derivation
     if flg_print_jacobians == 1:
         print_jacobians()
-    # Q4 Call EKF on data
 
-    # Q5: Call RTS smoother on data
-    # q_proc_noise_cov = 0.002  # instead of using prop_err_std ** 2, we inflate the process noise
-    # iekf.iekf_filter(pos_meas, vel_meas, pos_true, t, samples_count, t_step, q_proc_noise_cov, r_meas_noise_cov,
-    #                  flg_debug_fwd_only, update_interval_indices, a_trans_mat, c_obs_mat)
+    # Q4 Call EKF on data
+    state_ini = np.array([[pos_x_true[0], pos_y_true[0], ang_true[0]]]).T
+    cov_ini = np.diag([1, 1, 0.1])
+    r_meas_noise_cov = np.diag([3.6*10**(-5), 1.7*10**(-5), 8.2*10**(-5)])
+    q_proc_noise_cov = np.diag([1.1*10**(-3), 6.6*10**(-4)])
+    run_estimation(state_ini, cov_ini, r_meas_noise_cov, q_proc_noise_cov)
+
     # Plotting
     if flg_plot_show == 1:
         plt.show()
